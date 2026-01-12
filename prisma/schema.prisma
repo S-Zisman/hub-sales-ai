@@ -1,0 +1,137 @@
+// Prisma Schema for HUB SALES AI
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CrmStatus {
+  NEW
+  QUALIFIED
+  WARM
+  CUSTOMER
+  CHURNED
+  VIP
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  TRIALING
+}
+
+enum ResourceType {
+  GAMMA_PAGE
+  PDF_DOWNLOAD
+  ZOOM_LINK
+}
+
+enum ConversationRole {
+  USER
+  ASSISTANT
+  SYSTEM_NOTE
+}
+
+enum BotState {
+  IDLE
+  QUALIFICATION
+  PROBLEM_AMPLIFICATION
+  SOLUTION_PRESENTATION
+  CLOSING
+}
+
+model User {
+  id                String    @id @default(uuid())
+  telegramId        BigInt    @unique @map("telegram_id")
+  stripeCustomerId  String?   @unique @map("stripe_customer_id")
+  username          String?
+  firstName         String?   @map("first_name")
+  lastName          String?   @map("last_name")
+  crmStatus         CrmStatus @default(NEW) @map("crm_status")
+  leadScore         Int       @default(0) @map("lead_score")
+  isAdmin           Boolean   @default(false) @map("is_admin")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  subscriptions     Subscription[]
+  accessLinks       AccessLink[]
+  conversationLogs  ConversationLog[]
+  botSessions       BotSession[]
+
+  @@map("users")
+  @@index([telegramId])
+  @@index([crmStatus])
+}
+
+model Subscription {
+  id                  String            @id @default(uuid())
+  userId              String            @map("user_id")
+  stripeSubscriptionId String           @unique @map("stripe_subscription_id")
+  status              SubscriptionStatus
+  currentPeriodEnd    DateTime          @map("current_period_end")
+  planId              String            @map("plan_id")
+  autoRenew           Boolean          @default(true) @map("auto_renew")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  user                User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+  @@index([userId])
+  @@index([status])
+  @@index([currentPeriodEnd])
+}
+
+model AccessLink {
+  id            String       @id @default(uuid())
+  userId        String       @map("user_id")
+  token         String       @unique
+  resourceType  ResourceType @map("resource_type")
+  targetUrl     String       @map("target_url")
+  isUsed        Boolean      @default(false) @map("is_used")
+  expiresAt     DateTime     @map("expires_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("access_links")
+  @@index([token])
+  @@index([userId])
+  @@index([isUsed])
+}
+
+model ConversationLog {
+  id            BigInt          @id @default(autoincrement())
+  userId        String          @map("user_id")
+  role          ConversationRole
+  content       String          @db.Text
+  contextSummary String?        @map("context_summary") @db.Text
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("conversation_logs")
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model BotSession {
+  id            String    @id @default(uuid())
+  userId        String    @unique @map("user_id")
+  currentState  BotState  @default(IDLE) @map("current_state")
+  tempData      String?   @map("temp_data") @db.Text // JSON string for temporary data
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("bot_sessions")
+  @@index([userId])
+}
+
+
