@@ -1,9 +1,71 @@
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { config } from '../config';
 
-const anthropic = new Anthropic({
-  apiKey: config.claude.apiKey,
-});
+// Lazy initialization to ensure config is loaded
+let anthropicInstance: Anthropic | null = null;
+let openaiInstance: OpenAI | null = null;
+
+function getAnthropic(): Anthropic {
+  if (!anthropicInstance) {
+    if (!config.claude.apiKey) {
+      throw new Error('Claude API key is not configured');
+    }
+    anthropicInstance = new Anthropic({
+      apiKey: config.claude.apiKey,
+      baseURL: config.claude.apiUrl,
+    });
+    // Verify messages API is available
+    if (!anthropicInstance.messages) {
+      throw new Error('Anthropic messages API is not available. SDK version may be incorrect.');
+    }
+  }
+  return anthropicInstance;
+}
+
+function getOpenAI(): OpenAI {
+  if (!openaiInstance) {
+    if (!config.openai.apiKey) {
+      throw new Error('OpenAI API key is not configured');
+    }
+    openaiInstance = new OpenAI({
+      apiKey: config.openai.apiKey,
+    });
+  }
+  return openaiInstance;
+}
+
+async function generateWithOpenAI(
+  userMessage: string,
+  systemPrompt: string,
+  conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>
+): Promise<string> {
+  const openai = getOpenAI();
+  
+  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    { role: 'system', content: systemPrompt },
+  ];
+  
+  // Add conversation history
+  for (const msg of conversationHistory) {
+    messages.push({
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      content: msg.content,
+    });
+  }
+  
+  // Add current message
+  messages.push({ role: 'user', content: userMessage });
+  
+  const response = await openai.chat.completions.create({
+    model: config.openai.model,
+    messages: messages,
+    max_tokens: 1024,
+    temperature: 0.7,
+  });
+  
+  return response.choices[0]?.message?.content || 'Извините, не удалось получить ответ.';
+}
 
 export interface ClaudeMessage {
   role: 'user' | 'assistant' | 'system';
@@ -18,7 +80,7 @@ export interface ClaudeContext {
     teamSize?: string;
     painPoints?: string[];
   };
-  conversationHistory?: ClaudeMessage[];
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 /**
@@ -42,24 +104,84 @@ export async function generateSalesResponse(
     // Include last 10 messages for context (to avoid token limits)
     const recentHistory = context.conversationHistory.slice(-10);
     for (const msg of recentHistory) {
-      if (msg.role !== 'system') {
-        messages.unshift({
-          role: msg.role === 'assistant' ? 'assistant' : 'user',
-          content: msg.content,
-        });
-      }
+      messages.unshift({
+        role: msg.role,
+        content: msg.content,
+      });
     }
   }
 
   try {
-    // @ts-ignore - Anthropic SDK types may be outdated
-    const response = await anthropic.messages.create({
-      model: config.claude.model,
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: messages,
-      temperature: 0.7,
-    });
+    // Try OpenAI if configured as fallback
+    if (config.openai.useAsFallback && config.openai.apiKey) {
+      console.log('Using OpenAI as fallback...');
+      return await generateWithOpenAI(userMessage, systemPrompt, context.conversationHistory || []);
+    }
+    
+    // Try Claude API
+    const anthropic = getAnthropic();
+    
+    // Try the configured model first
+    let modelToUse = config.claude.model;
+    let response;
+    
+    try {
+      response = await anthropic.messages.create({
+        model: modelToUse,
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: messages,
+        temperature: 0.7,
+      });
+    } catch (firstError: any) {
+      // If 404, try alternative model names
+      if (firstError?.statusCode === 404 || (firstError?.error?.type === 'not_found_error')) {
+        console.log(`Model ${modelToUse} not found, trying alternatives...`);
+        
+        // Try claude-3-5-sonnet-20241022 (latest)
+        const alternatives = [
+          'claude-3-5-sonnet-20241022',
+          'claude-3-5-sonnet-20240620',
+          'claude-3-sonnet-20240229',
+        ];
+        
+        let lastError = firstError;
+        for (const altModel of alternatives) {
+          if (altModel === modelToUse) continue;
+          try {
+            console.log(`Trying model: ${altModel}`);
+            response = await anthropic.messages.create({
+              model: altModel,
+              max_tokens: 1024,
+              system: systemPrompt,
+              messages: messages,
+              temperature: 0.7,
+            });
+            console.log(`✅ Success with model: ${altModel}`);
+            break;
+          } catch (altError: any) {
+            lastError = altError;
+            continue;
+          }
+        }
+        
+        if (!response) {
+          // If all Claude models failed and OpenAI is available, use it as fallback
+          if (config.openai.apiKey) {
+            console.log('All Claude models failed, falling back to OpenAI...');
+            return await generateWithOpenAI(userMessage, systemPrompt, context.conversationHistory || []);
+          }
+          throw lastError;
+        }
+      } else {
+        // If non-404 error and OpenAI available, try fallback
+        if (config.openai.apiKey) {
+          console.log('Claude API error, falling back to OpenAI...');
+          return await generateWithOpenAI(userMessage, systemPrompt, context.conversationHistory || []);
+        }
+        throw firstError;
+      }
+    }
 
     const content = response.content[0];
     if (content.type === 'text') {
@@ -67,8 +189,32 @@ export async function generateSalesResponse(
     }
 
     throw new Error('Unexpected response format from Claude API');
-  } catch (error) {
+  } catch (error: any) {
     console.error('Claude API Error:', error);
+    
+    // If OpenAI is available, use it as final fallback
+    if (config.openai.apiKey) {
+      console.log('Using OpenAI as final fallback...');
+      try {
+        return await generateWithOpenAI(userMessage, systemPrompt, context.conversationHistory || []);
+      } catch (openaiError) {
+        console.error('OpenAI fallback also failed:', openaiError);
+        throw new Error('Both Claude and OpenAI APIs failed. Please check your API keys.');
+      }
+    }
+    
+    // Check if it's an authentication error
+    if (error?.statusCode === 401 || error?.statusCode === 403) {
+      throw new Error('Claude API authentication failed. Please check your API key.');
+    }
+    
+    // If it's a 404 model not found error, provide helpful message
+    if (error?.statusCode === 404 || (error?.error?.type === 'not_found_error')) {
+      const errorMsg = error?.error?.message || error?.message || '';
+      console.error(`Model not found: ${config.claude.model}. Error: ${errorMsg}`);
+      throw new Error(`Claude model "${config.claude.model}" not found. Please check the model name and API key permissions. Original error: ${errorMsg}`);
+    }
+    
     throw error;
   }
 }

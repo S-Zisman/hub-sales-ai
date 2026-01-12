@@ -59,10 +59,12 @@ if (useWebhook) {
   }).catch((err) => {
     console.log('No webhook to delete or error:', err.message);
   }).finally(() => {
-    // Start long polling
+    // Start long polling with channel_post updates
     console.log('Starting bot.start()...');
-    bot.start().then(() => {
-      console.log('Bot started successfully, waiting for updates...');
+    bot.start({
+      allowed_updates: ['message', 'channel_post', 'callback_query'],
+    }).then(() => {
+      console.log('Bot started successfully, waiting for updates (including channel posts)...');
     }).catch((err) => {
       console.error('Failed to start bot:', err);
     });

@@ -1,8 +1,9 @@
-import { Context, InlineKeyboard } from 'grammy';
+import { Context, InlineKeyboard, Bot } from 'grammy';
 import { prisma } from '../database/client';
 import { config } from '../config';
 import { broadcastQueue } from '../services/queue';
 import { CrmStatus } from '@prisma/client';
+import { inviteUserToClub, kickUserFromClub } from '../services/subscription';
 
 /**
  * Check if user is admin (including super admin from env)
@@ -32,7 +33,7 @@ export async function handleAdmin(ctx: Context): Promise<void> {
     return;
   }
 
-  const menuMessage = `🔐 **АДМИНСКАЯ ПАНЕЛЬ AI Business HUB**
+    const menuMessage = `🔐 **АДМИНСКАЯ ПАНЕЛЬ AI Business HUB**
 
 Доступные команды:
 
@@ -53,6 +54,11 @@ export async function handleAdmin(ctx: Context): Promise<void> {
   Пример: /lead 199140013
 
 📢 /broadcast - рассылка сообщений
+
+🔑 **Управление доступом к клубу:**
+➕ /add_access [telegram_id] - предоставить доступ вручную
+➖ /remove_access [telegram_id] - удалить доступ
+📋 /get_channel_id - получить ID канала для настройки
 
 Статусы для команды /leads:
 • NEW - новые
@@ -600,5 +606,197 @@ export async function processBroadcast(
       telegramId: Number(user.telegramId),
       message,
     });
+  }
+}
+
+/**
+ * Admin command: /add_access [telegram_id] - Manually add user to club
+ * Note: bot instance should be passed from bot/index.ts
+ */
+export async function handleAddAccess(ctx: Context, bot: Bot): Promise<void> {
+  const telegramId = ctx.from?.id;
+  if (!telegramId || !(await isAdmin(telegramId))) {
+    await ctx.reply('❌ У вас нет доступа к этой команде.');
+    return;
+  }
+
+  // Extract telegram_id from command text
+  const text = ctx.message?.text || '';
+  const match = text.match(/^\/add_access(?:\s+(.+))?$/);
+  const targetTelegramIdParam = match?.[1]?.trim();
+  
+  if (!targetTelegramIdParam) {
+    await ctx.reply('Использование: /add_access [telegram_id]');
+    return;
+  }
+
+  try {
+    await ctx.replyWithChatAction('typing');
+
+    const targetTelegramId = parseInt(targetTelegramIdParam);
+    
+    // Check if user exists
+    const user = await prisma.user.findUnique({
+      where: { telegramId: BigInt(targetTelegramId) },
+    });
+
+    if (!user) {
+      await ctx.reply(`❌ Пользователь с ID ${targetTelegramIdParam} не найден в базе.`);
+      return;
+    }
+
+    // Create or activate subscription manually
+    const existingSub = await prisma.subscription.findFirst({
+      where: { userId: user.id },
+    });
+
+    if (existingSub) {
+      await prisma.subscription.update({
+        where: { id: existingSub.id },
+        data: {
+          status: 'ACTIVE',
+          currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
+        },
+      });
+    } else {
+      await prisma.subscription.create({
+        data: {
+          userId: user.id,
+          stripeSubscriptionId: `manual_${Date.now()}`,
+          status: 'ACTIVE',
+          currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          planId: 'premium_hub',
+          autoRenew: false,
+        },
+      });
+    }
+
+    // Update user status
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        crmStatus: 'CUSTOMER',
+        updatedAt: new Date(),
+      },
+    });
+
+    // Send invite link
+    const inviteLink = await inviteUserToClub(bot, targetTelegramId);
+    
+    await bot.api.sendMessage(
+      targetTelegramId,
+      `✅ Вам предоставлен доступ к AI Business HUB!\n\n` +
+      `Используйте эту ссылку для входа в закрытый канал:\n${inviteLink}\n\n` +
+      `Ссылка одноразовая и действительна 24 часа.`
+    );
+
+    await ctx.reply(
+      `✅ Доступ предоставлен пользователю ${targetTelegramIdParam}\n\n` +
+      `Пригласительная ссылка отправлена.`
+    );
+
+  } catch (error) {
+    console.error('Error in handleAddAccess:', error);
+    await ctx.reply(`❌ Ошибка: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Admin command: /remove_access [telegram_id] - Manually remove user from club
+ */
+export async function handleRemoveAccess(ctx: Context, bot: Bot): Promise<void> {
+  const telegramId = ctx.from?.id;
+  if (!telegramId || !(await isAdmin(telegramId))) {
+    await ctx.reply('❌ У вас нет доступа к этой команде.');
+    return;
+  }
+
+  // Extract telegram_id from command text
+  const text = ctx.message?.text || '';
+  const match = text.match(/^\/remove_access(?:\s+(.+))?$/);
+  const targetTelegramIdParam = match?.[1]?.trim();
+  
+  if (!targetTelegramIdParam) {
+    await ctx.reply('Использование: /remove_access [telegram_id]');
+    return;
+  }
+
+  try {
+    await ctx.replyWithChatAction('typing');
+
+    const targetTelegramId = parseInt(targetTelegramIdParam);
+    
+    // Find user
+    const user = await prisma.user.findUnique({
+      where: { telegramId: BigInt(targetTelegramId) },
+      include: { subscriptions: true },
+    });
+
+    if (!user) {
+      await ctx.reply(`❌ Пользователь с ID ${targetTelegramIdParam} не найден.`);
+      return;
+    }
+
+    // Cancel all subscriptions
+    await prisma.subscription.updateMany({
+      where: { userId: user.id },
+      data: { status: 'CANCELED' },
+    });
+
+    // Update user status
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        crmStatus: 'CHURNED',
+        updatedAt: new Date(),
+      },
+    });
+
+    // Kick from channel
+    await kickUserFromClub(bot, targetTelegramId);
+
+    await bot.api.sendMessage(
+      targetTelegramId,
+      `⚠️ Ваш доступ к AI Business HUB был приостановлен администратором.\n\n` +
+      `Если у вас есть вопросы, обратитесь в поддержку.`
+    );
+
+    await ctx.reply(
+      `✅ Доступ удален для пользователя ${targetTelegramIdParam}\n\n` +
+      `Пользователь удален из канала.`
+    );
+
+  } catch (error) {
+    console.error('Error in handleRemoveAccess:', error);
+    await ctx.reply(`❌ Ошибка: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Admin command: /get_channel_id - Get channel ID for configuration
+ */
+export async function handleGetChannelId(ctx: Context): Promise<void> {
+  const telegramId = ctx.from?.id;
+  if (!telegramId || !(await isAdmin(telegramId))) {
+    await ctx.reply('❌ У вас нет доступа к этой команде.');
+    return;
+  }
+
+  if (!config.telegram.clubChannelId) {
+    await ctx.reply(
+      `📋 **Как получить ID канала:**\n\n` +
+      `1. Добавьте бота @userinfobot в канал\n` +
+      `2. Или перешлите любое сообщение из канала боту @getidsbot\n` +
+      `3. ID канала начинается с "-100" (например: -1001234567890)\n\n` +
+      `После получения ID добавьте в .env:\n` +
+      `CLUB_CHANNEL_ID=-1001234567890`,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    await ctx.reply(
+      `✅ ID канала настроен: \`${config.telegram.clubChannelId}\`\n\n` +
+      `Если нужно изменить, обновите CLUB_CHANNEL_ID в .env`,
+      { parse_mode: 'Markdown' }
+    );
   }
 }

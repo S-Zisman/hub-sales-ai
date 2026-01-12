@@ -333,9 +333,23 @@ export async function handleMessage(ctx: Context): Promise<void> {
     case BotState.CLOSING:
       // Handle closing stage
       const messageText = ctx.message.text;
+      const userForHistory = await prisma.user.findUnique({
+        where: { telegramId: BigInt(telegramId) },
+      });
+      
+      const historyLogs = userForHistory ? await prisma.conversationLog.findMany({
+        where: { userId: userForHistory.id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }) : [];
+      
       const closingContext = {
         stage: 'CLOSING',
         userData: tempData,
+        conversationHistory: historyLogs.reverse().map(log => ({
+          role: log.role === 'USER' ? 'user' : 'assistant' as 'user' | 'assistant',
+          content: log.content,
+        })),
       };
       const aiResponse = await generateSalesResponse(messageText, closingContext);
       await ctx.reply(aiResponse);

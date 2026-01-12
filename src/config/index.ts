@@ -41,7 +41,14 @@ export const config = {
   claude: {
     apiKey: process.env.KLAUDE_API_KEY!,
     apiUrl: process.env.KLAUDE_API_BASE_URL || 'https://api.anthropic.com/v1',
-    model: process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022',
+    model: process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20240620',
+  },
+
+  // OpenAI API (fallback)
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    useAsFallback: process.env.USE_OPENAI === 'true',
   },
 
   // Server

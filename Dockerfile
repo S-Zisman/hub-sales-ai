@@ -6,8 +6,10 @@ RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 # Install all dependencies (including dev for build)
+# Note: @anthropic-ai/sdk must be >= 0.27.0 for messages API support
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm ci && \
+    npm list @anthropic-ai/sdk || npm install @anthropic-ai/sdk@^0.27.0
 
 # Copy source code
 COPY . .
